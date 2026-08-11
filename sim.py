@@ -105,12 +105,12 @@ MOON_INCLINATION = np.deg2rad(5.145)
 #   D) lunar powered descent
 N_PARK = 24
 N_TLI = 8
-N_TRANSFER = 144
+N_TRANSFER = 192
 N_DESCENT = 90
 
 DT_PARK = 180.0            # 3 min
 DT_TLI = 30.0              # 30 s
-DT_TRANSFER = 1800.0       # 30 min
+DT_TRANSFER = 1350.0       # 22.5 min (same total transfer time, finer grid)
 DT_DESCENT = 40.0          # 40 s
 
 DT = np.concatenate([
@@ -142,6 +142,9 @@ TOUCHDOWN_TARGET_TOL = 0.0003         # km/s = 0.3 m/s target tolerance
 
 # Wide at the start; velocity and altitude schedules tighten the final approach.
 LANDING_CONE_ANGLE = np.deg2rad(70.0)
+TERMINAL_LANDING_CONE_ANGLE = np.deg2rad(35.0)
+TERMINAL_CONE_START_FRACTION = 0.95
+LOW_ALT_HORIZONTAL_SPEED_SLOPE = 0.0052  # (km/s) per km altitude
 
 # Descent gate.
 DESCENT_GATE_ALT_MIN = 50.0            # km
@@ -149,7 +152,7 @@ DESCENT_GATE_ALT_MAX = 500.0           # km
 DESCENT_GATE_SPEED_MAX = 2.5           # km/s Moon-relative
 
 # SCP parameters.
-MAX_SCP_ITER = 18
+MAX_SCP_ITER = 22
 REFERENCE_UPDATE_ALPHA = 0.55
 VIRTUAL_DV_TOL = 1.0e-2                # km/s integrated virtual acceleration
 TRAJECTORY_CHANGE_TOL = 10.0           # km RMS
@@ -517,7 +520,7 @@ def solve_with_available_solver(problem):
 # Two-stage solve:
 #   1) feasibility restoration: drive dynamics/landing slacks toward zero
 #   2) fuel optimization: minimize propellant while keeping slacks near zero
-FEASIBILITY_ITERS = 7
+FEASIBILITY_ITERS = 8
 FUEL_ITERS = MAX_SCP_ITER - FEASIBILITY_ITERS
 
 R_solution = None
@@ -763,6 +766,7 @@ def build_scp_problem(mode, iteration, trust_multiplier=1.0, hard_landing=False)
         altitude = n_land @ delta_r
         horizontal_error = P_HORIZONTAL @ delta_r
         v_rel = V[:, k] - v_moon_k
+        vertical_speed = n_land @ v_rel
 
         vmax_rel = 2.5 * (1.0 - frac)**1.3 + 0.030
 
@@ -771,10 +775,19 @@ def build_scp_problem(mode, iteration, trust_multiplier=1.0, hard_landing=False)
             altitude >= -S_ALT[j],
             cp.norm(horizontal_error, 2)
             <= np.tan(LANDING_CONE_ANGLE) * altitude + S_CONE[j],
+            # Powered descent may hover, but it may never climb away from the
+            # surface.  This removes the descend-rise-descend solution that an
+            # altitude lower bound alone still permits.
+            vertical_speed <= 0.0,
         ]
 
+        if k < N:
+            r_moon_next, _ = moon_state(TIME[k + 1])
+            r_land_next = r_moon_next + R_M * n_land
+            altitude_next = n_land @ (R[:, k + 1] - r_land_next)
+            constraints += [altitude_next <= altitude]
+
         if frac >= 0.75:
-            vertical_speed = n_land @ v_rel
             horizontal_speed = P_HORIZONTAL @ v_rel
             terminal_frac = (frac - 0.75) / 0.25
             max_down_speed = (
@@ -789,6 +802,24 @@ def build_scp_problem(mode, iteration, trust_multiplier=1.0, hard_landing=False)
                 vertical_speed >= -max_down_speed - S_TERMINAL[j],
                 cp.norm(horizontal_speed, 2)
                 <= max_horizontal + S_TERMINAL[j],
+                # Near the surface, allowable lateral speed collapses toward
+                # the touchdown limit instead of permitting a long low hover
+                # or sideways crawl.
+                cp.norm(horizontal_speed, 2)
+                <= (
+                    TOUCHDOWN_HORIZONTAL_MAX
+                    + LOW_ALT_HORIZONTAL_SPEED_SLOPE * altitude
+                    + S_TERMINAL[j]
+                ),
+            ]
+
+        if frac >= TERMINAL_CONE_START_FRACTION:
+            constraints += [
+                cp.norm(horizontal_error, 2)
+                <= (
+                    np.tan(TERMINAL_LANDING_CONE_ANGLE) * altitude
+                    + S_CONE[j]
+                )
             ]
 
     # -------------------------------------------------------------------------
@@ -1087,6 +1118,16 @@ moon_rel_pos = R_solution - moon_positions
 moon_rel_vel = V_solution - moon_velocities
 moon_rel_speed = np.linalg.norm(moon_rel_vel, axis=0)
 
+descent_altitude = np.array([
+    n_land @ (
+        R_solution[:, k]
+        - (moon_positions[:, k] + R_M * n_land)
+    )
+    for k in range(K_DESCENT_START, N + 1)
+])
+descent_altitude_change = np.diff(descent_altitude)
+max_descent_climb = max(float(np.max(descent_altitude_change)), 0.0)
+
 # Check exact nonlinear one-step defect using solved T/M and exact gravity.
 pos_defects = []
 vel_defects = []
@@ -1127,6 +1168,7 @@ print(
 )
 print(f"Max exact nonlinear position defect: {pos_defects.max():.3f} km")
 print(f"Max exact nonlinear velocity defect: {vel_defects.max():.6f} km/s")
+print(f"Maximum altitude increase in descent: {max_descent_climb * 1000.0:.3f} m/step")
 print(
     "Integrated virtual delta-v:       "
     f"{np.sum(np.linalg.norm(NU_solution, axis=0) * DT):.6f} km/s"
@@ -2392,26 +2434,30 @@ def create_static_mission_summary():
     # ------------------------------------------------------------------
     ax_transfer.plot(
         R_solution[0], R_solution[1],
-        color="tab:blue", linewidth=2.2, label="Optimized spacecraft path",
+        linewidth=2.2, label="Optimized spacecraft path",
     )
     ax_transfer.plot(
         moon_positions[0], moon_positions[1],
-        color="0.45", linestyle="--", linewidth=1.1, label="Moon path",
+        linestyle="--", linewidth=1.1, label="Moon path",
     )
+    earth_display_radius = max(R_E, 0.025 * D_EM)
+    moon_display_radius = max(R_M, 0.018 * D_EM)
     ax_transfer.add_patch(plt.Circle(
-        (0.0, 0.0), R_E, color="tab:blue", alpha=0.50, label="Earth",
+        (0.0, 0.0), earth_display_radius,
+        alpha=0.50, hatch="///", label="Earth (display size exaggerated)",
     ))
     ax_transfer.add_patch(plt.Circle(
         (moon_positions[0, -1], moon_positions[1, -1]),
-        R_M, color="0.55", alpha=0.80, label="Moon at landing",
+        moon_display_radius, alpha=0.70, hatch="...",
+        label="Moon (display size exaggerated)",
     ))
     ax_transfer.scatter(
         [R_solution[0, 0]], [R_solution[1, 0]],
-        marker="o", s=45, color="tab:green", zorder=6, label="Mission start",
+        marker="o", s=45, zorder=6, label="Mission start",
     )
     ax_transfer.scatter(
         [R_solution[0, -1]], [R_solution[1, -1]],
-        marker="*", s=130, color="gold", edgecolor="black", zorder=7,
+        marker="*", s=130, zorder=7,
         label="Landing",
     )
 
@@ -2424,11 +2470,11 @@ def create_static_mission_summary():
         return active[pick]
 
     overview_groups = [
-        ("TLI thrust", K_TLI_START, K_TRANSFER_START, 6, "tab:red"),
-        ("MCC thrust", K_TRANSFER_START, K_DESCENT_START, 10, "tab:orange"),
-        ("Descent thrust", K_DESCENT_START, N, 7, "tab:purple"),
+        ("TLI thrust", K_TLI_START, K_TRANSFER_START, 6),
+        ("MCC thrust", K_TRANSFER_START, K_DESCENT_START, 10),
+        ("Descent thrust", K_DESCENT_START, N, 7),
     ]
-    for label, start, stop, count, color in overview_groups:
+    for label, start, stop, count in overview_groups:
         indices = sampled_active_indices(start, stop, count)
         first = True
         for k in indices:
@@ -2444,12 +2490,12 @@ def create_static_mission_summary():
                 xy=R_solution[:2, k] + delta,
                 xytext=R_solution[:2, k],
                 arrowprops=dict(
-                    arrowstyle="-|>", color=color, lw=1.5,
+                    arrowstyle="-|>", lw=1.5,
                     mutation_scale=11, alpha=0.88,
                 ),
             )
             if first:
-                ax_transfer.plot([], [], color=color, linewidth=2.0, label=label)
+                ax_transfer.plot([], [], linewidth=2.0, label=label)
                 first = False
 
     ax_transfer.set_title("Earth → Moon navigation (top-down 2-D)")
@@ -2479,38 +2525,62 @@ def create_static_mission_summary():
         horizontal = np.linalg.norm(P_HORIZONTAL @ delta_r)
         frac = (k - K_DESCENT_START) / max(1, N - K_DESCENT_START)
         vmax = 2.5 * (1.0 - frac)**1.3 + 0.030
+        low_alt_horizontal_limit = (
+            TOUCHDOWN_HORIZONTAL_MAX
+            + LOW_ALT_HORIZONTAL_SPEED_SLOPE * max(altitude[i], 0.0)
+        )
         constraint_ok[i] = (
             altitude[i] >= -1.0e-6
             and horizontal <= np.tan(LANDING_CONE_ANGLE) * max(altitude[i], 0.0) + 1.0e-6
             and np.linalg.norm(v_rel) <= vmax + 1.0e-6
+            and (e_up @ v_rel) <= 1.0e-8
         )
+        if frac >= 0.75:
+            constraint_ok[i] &= (
+                np.linalg.norm(P_HORIZONTAL @ v_rel)
+                <= low_alt_horizontal_limit + 1.0e-8
+            )
+        if frac >= TERMINAL_CONE_START_FRACTION:
+            constraint_ok[i] &= (
+                horizontal
+                <= np.tan(TERMINAL_LANDING_CONE_ANGLE)
+                * max(altitude[i], 0.0) + 1.0e-6
+            )
+
+    constraint_ok[1:] &= np.diff(altitude) <= 1.0e-8
 
     max_alt = max(float(np.max(altitude)), 1.0)
     cone_alt = np.linspace(0.0, max_alt, 200)
     cone_edge = np.tan(LANDING_CONE_ANGLE) * cone_alt
     ax_landing.fill_betweenx(
         cone_alt, -cone_edge, cone_edge,
-        color="tab:orange", alpha=0.12, label="Allowed landing cone",
+        alpha=0.12, label="Allowed landing cone",
     )
-    ax_landing.plot(cone_edge, cone_alt, "--", color="tab:orange", linewidth=1.2)
-    ax_landing.plot(-cone_edge, cone_alt, "--", color="tab:orange", linewidth=1.2)
+    ax_landing.plot(cone_edge, cone_alt, "--", linewidth=1.2)
+    ax_landing.plot(-cone_edge, cone_alt, "--", linewidth=1.2)
+    terminal_cone_edge = np.tan(TERMINAL_LANDING_CONE_ANGLE) * cone_alt
+    ax_landing.plot(
+        terminal_cone_edge, cone_alt, ":", linewidth=1.4,
+        label=f"Terminal cone ({np.degrees(TERMINAL_LANDING_CONE_ANGLE):.0f} deg)",
+    )
+    ax_landing.plot(-terminal_cone_edge, cone_alt, ":", linewidth=1.4)
     surface_half = max(float(np.max(np.abs(downrange))) * 1.15, 10.0)
     ax_landing.plot(
         [-surface_half, surface_half], [0.0, 0.0],
-        color="0.25", linewidth=5.0, solid_capstyle="butt", label="Flat lunar surface",
+        linewidth=5.0, solid_capstyle="butt", label="Flat lunar surface",
     )
     ax_landing.plot(
-        downrange, altitude, color="tab:blue", linewidth=2.5,
+        downrange, altitude, linewidth=2.5,
         label="Optimized landing trajectory",
     )
     ax_landing.scatter(
         downrange[constraint_ok], altitude[constraint_ok],
-        s=14, color="tab:green", zorder=5, label="Constraints satisfied",
+        s=14, marker="o", zorder=5, label="Constraints satisfied",
     )
     if np.any(~constraint_ok):
         ax_landing.scatter(
             downrange[~constraint_ok], altitude[~constraint_ok],
-            s=28, color="tab:red", marker="x", zorder=6, label="Constraint violation",
+            s=28, marker="x", zorder=6, label="Constraint violation",
         )
 
     landing_thrust_indices = sampled_active_indices(K_DESCENT_START, N, 13)
@@ -2530,11 +2600,11 @@ def create_static_mission_summary():
             xy=np.array([downrange[i], altitude[i]]) + delta,
             xytext=np.array([downrange[i], altitude[i]]),
             arrowprops=dict(
-                arrowstyle="-|>", color="tab:red", lw=1.7,
+                arrowstyle="-|>", lw=1.7,
                 mutation_scale=11, alpha=0.90,
             ),
         )
-    ax_landing.plot([], [], color="tab:red", linewidth=2.0, label="Thrust direction")
+    ax_landing.plot([], [], linewidth=2.0, label="Thrust direction")
 
     v_touch_rel = V_solution[:, -1] - v_moon_final
     touch_speed = np.linalg.norm(v_touch_rel) * 1000.0
@@ -2544,13 +2614,14 @@ def create_static_mission_summary():
         0.02, 0.98,
         "LANDING CONSTRAINTS\n"
         f"cone half-angle: {np.degrees(LANDING_CONE_ANGLE):.0f} deg\n"
+        f"terminal cone:   {np.degrees(TERMINAL_LANDING_CONE_ANGLE):.0f} deg\n"
         f"touch speed:     {touch_speed:.2f} / {TOUCHDOWN_SPEED_MAX * 1000.0:.1f} m/s\n"
         f"horizontal:      {touch_horizontal:.2f} / {TOUCHDOWN_HORIZONTAL_MAX * 1000.0:.1f} m/s\n"
         f"downward:        {touch_down:.2f} m/s",
         transform=ax_landing.transAxes, va="top", family="monospace",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.84),
+        bbox=dict(boxstyle="round", alpha=0.84),
     )
-    ax_landing.scatter([0.0], [0.0], marker="*", s=150, color="gold", edgecolor="black", zorder=8)
+    ax_landing.scatter([0.0], [0.0], marker="*", s=150, zorder=8)
     ax_landing.set_title("Lunar powered descent (local side view)")
     ax_landing.set_xlabel("Downrange [km]")
     ax_landing.set_ylabel("Altitude above flat surface [km]")
