@@ -35,6 +35,9 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 
 # =============================================================================
@@ -132,8 +135,11 @@ K_DESCENT_START = N_PARK + N_TLI + N_TRANSFER
 # =============================================================================
 
 MAX_EARTH_INERTIAL_SPEED = 12.5       # km/s
-TOUCHDOWN_SPEED_MAX = 0.002           # km/s = 2 m/s
-TOUCHDOWN_HORIZONTAL_MAX = 0.0015     # km/s = 1.5 m/s
+TOUCHDOWN_SPEED_MAX = 0.005           # km/s = 5 m/s
+TOUCHDOWN_HORIZONTAL_MAX = 0.0025     # km/s = 2.5 m/s
+TOUCHDOWN_DOWN_TARGET = 0.0035        # km/s = 3.5 m/s downward
+TOUCHDOWN_LATERAL_TARGET = 0.0015     # km/s = 1.5 m/s along-track
+TOUCHDOWN_TARGET_TOL = 0.0003         # km/s = 0.3 m/s target tolerance
 
 # Wide at the start; velocity and altitude schedules tighten the final approach.
 LANDING_CONE_ANGLE = np.deg2rad(70.0)
@@ -257,6 +263,10 @@ t_land /= np.linalg.norm(t_land)
 
 P_HORIZONTAL = np.eye(3) - np.outer(n_land, n_land)
 r_land_final = r_moon_final + R_M * n_land
+v_touch_target = (
+    -TOUCHDOWN_DOWN_TARGET * n_land
+    + TOUCHDOWN_LATERAL_TARGET * t_land
+)
 
 
 # =============================================================================
@@ -428,12 +438,23 @@ def make_initial_reference():
         r_moon_k, v_moon_k = moon_state(TIME[k])
 
         rel_vec = H0 * n_land + L0 * t_land
-        r_ref[:, k] = r_moon_k + R_M * n_land + q * rel_vec
-        v_ref[:, k] = v_moon_k + dq_dt * rel_vec
+        # Quintic position decay plus a Hermite terminal-velocity term.  The
+        # latter produces a deliberate angled, moderately firm touchdown
+        # instead of forcing the reference to settle vertically at zero speed.
+        h11 = s**3 - s**2
+        dh11_dt = (3.0 * s**2 - 2.0 * s) / descent_duration
+        r_ref[:, k] = (
+            r_moon_k + R_M * n_land + q * rel_vec
+            + h11 * descent_duration * v_touch_target
+        )
+        v_ref[:, k] = (
+            v_moon_k + dq_dt * rel_vec
+            + dh11_dt * descent_duration * v_touch_target
+        )
 
     # Enforce exact terminal reference state.
     r_ref[:, N] = r_land_final
-    v_ref[:, N] = v_moon_final
+    v_ref[:, N] = v_moon_final + v_touch_target
     v_ref[:, 0] = v0
 
     # -------------------------------------------------------------------------
@@ -783,6 +804,8 @@ def build_scp_problem(mode, iteration, trust_multiplier=1.0, hard_landing=False)
             cp.norm(P_HORIZONTAL @ v_touch_rel, 2)
             <= TOUCHDOWN_HORIZONTAL_MAX,
             n_land @ v_touch_rel <= 0.0,
+            cp.norm(v_touch_rel - v_touch_target, 2)
+            <= TOUCHDOWN_TARGET_TOL,
             S_CONE == 0,
             S_SPEED == 0,
             S_ALT == 0,
@@ -799,6 +822,8 @@ def build_scp_problem(mode, iteration, trust_multiplier=1.0, hard_landing=False)
             cp.norm(P_HORIZONTAL @ v_touch_rel, 2)
             <= TOUCHDOWN_HORIZONTAL_MAX + S_TOUCH_HORIZ,
             n_land @ v_touch_rel <= S_TOUCH_SPEED,
+            cp.norm(v_touch_rel - v_touch_target, 2)
+            <= TOUCHDOWN_TARGET_TOL + S_TOUCH_SPEED,
         ]
 
     # -------------------------------------------------------------------------
@@ -1343,8 +1368,9 @@ plt.close("all")
 #   5) landing-site local ENU animation with adaptive camera zoom
 #   6) live altitude / speed / thrust / mass / propellant telemetry
 
-GENERATE_MPL_HTML = True
-GENERATE_MPL_MP4 = True     # automatically skipped if ffmpeg is unavailable
+GENERATE_MPL_HTML = False
+GENERATE_MPL_MP4 = False
+GENERATE_COMBINED_MISSION = True
 SHOW_ANIMATION_WINDOW = False
 
 ANIMATION_FPS = 100
@@ -1360,6 +1386,8 @@ LANDING_HTML = "./apollo_landing_ground_view_matplotlib_100fps.html"
 OVERVIEW_MP4 = "./apollo_mission_overview_matplotlib_100fps.mp4"
 DESCENT_MP4 = "./apollo_descent_moon_context_matplotlib_100fps.mp4"
 LANDING_MP4 = "./apollo_landing_ground_view_matplotlib_100fps.mp4"
+COMBINED_MP4 = "./apollo_mission_complete_matplotlib_100fps.mp4"
+COMBINED_HTML = "./apollo_mission_complete_matplotlib_100fps.html"
 
 # Matplotlib HTML embeds PNG frames as base64.
 mpl.rcParams["animation.embed_limit"] = 500.0  # MB
@@ -1510,14 +1538,11 @@ def sphere_mesh(center, radius, n_u=22, n_v=12):
 
 
 def lunar_surface_patch(half_width, n=45):
-    """Exact spherical surface in landing-site local tangent coordinates."""
+    """Flat landing-site tangent plane used as the local lunar ground."""
     x = np.linspace(-half_width, half_width, n)
     y = np.linspace(-half_width, half_width, n)
     X, Y = np.meshgrid(x, y)
-    rho2 = X**2 + Y**2
-    inside = rho2 < (0.98 * R_M)**2
-    Z = np.full_like(X, np.nan, dtype=float)
-    Z[inside] = np.sqrt(R_M**2 - rho2[inside]) - R_M
+    Z = np.zeros_like(X)
     return X, Y, Z
 
 
@@ -1577,6 +1602,7 @@ def add_thrust_visuals(
     artist_list,
     arrow_scale=1.4,
     flame_scale=1.7,
+    min_arrow_fraction=0.18,
 ):
     """Add +T force arrow and -T exhaust flame. Artists are removable next frame."""
     thrust_mag = np.linalg.norm(thrust_vector)
@@ -1587,14 +1613,19 @@ def add_thrust_visuals(
     frac = thrust_fraction(thrust_vector, t)
 
     # +T force arrow from vehicle center.
-    arrow_length = rocket_length * arrow_scale * max(frac, 0.04)
+    # Keep low-thrust navigation corrections legible.  Magnitude still changes
+    # the arrow length, but the display does not collapse to a nearly invisible
+    # mark at the Earth-Moon overview scale.
+    display_frac = min_arrow_fraction + (1.0 - min_arrow_fraction) * frac
+    arrow_length = rocket_length * arrow_scale * display_frac
     q = ax.quiver(
         position[0], position[1], position[2],
         t_dir[0], t_dir[1], t_dir[2],
         length=arrow_length,
         normalize=True,
-        linewidth=2.0,
-        arrow_length_ratio=0.18,
+        color="tab:red",
+        linewidth=3.2,
+        arrow_length_ratio=0.26,
     )
     artist_list.append(q)
 
@@ -1670,12 +1701,17 @@ def create_overview_animation():
     V_anim = interp_rows(V_solution, TIME, animation_time)
     T_anim = interp_rows(T_solution, TIME[:-1], animation_time)
     moon_anim = interp_rows(moon_positions, TIME, animation_time)
+    thrust_mag_anim = np.linalg.norm(T_anim, axis=0)
+    thrust_frac_anim = np.array([
+        thrust_fraction(T_anim[:, i], animation_time[i])
+        for i in range(len(animation_time))
+    ])
 
     # Physically scaled rocket is invisible at Earth-Moon scale.
     rocket_length = 0.018 * D_EM
     rocket_radius = 0.0035 * D_EM
 
-    fig = plt.figure(figsize=(11, 8.5))
+    fig = plt.figure(figsize=(11.5, 8.5))
     ax = fig.add_subplot(111, projection="3d")
 
     ax.plot(
@@ -1709,6 +1745,39 @@ def create_overview_animation():
     ax.set_zlabel("Z [km]")
     ax.view_init(elev=27, azim=-54)
     ax.legend(loc="upper left")
+
+    # Mission-wide thrust program.  Normalizing by each phase's engine limit
+    # keeps small MCC/descent commands visible beside the much larger TLI burn.
+    thrust_ax = fig.add_axes([0.64, 0.69, 0.30, 0.16])
+    thrust_ax.plot(
+        animation_time / 3600.0,
+        100.0 * thrust_frac_anim,
+        color="tab:red",
+        linewidth=1.5,
+    )
+    thrust_ax.fill_between(
+        animation_time / 3600.0,
+        0.0,
+        100.0 * thrust_frac_anim,
+        color="tab:red",
+        alpha=0.18,
+    )
+    thrust_cursor = thrust_ax.axvline(0.0, color="black", linewidth=1.2)
+    thrust_dot, = thrust_ax.plot([], [], marker="o", color="tab:red", markersize=5)
+    thrust_ax.set_xlim(0.0, T_TOTAL / 3600.0)
+    thrust_ax.set_ylim(0.0, 105.0)
+    thrust_ax.set_xlabel("Mission time [h]", fontsize=8)
+    thrust_ax.set_ylabel("Phase max [%]", fontsize=8)
+    thrust_ax.set_title("Thrust program (phase-normalized)", fontsize=9)
+    thrust_ax.tick_params(labelsize=7)
+    thrust_ax.grid(alpha=0.22)
+
+    thrust_hud = ax.text2D(
+        0.02, 0.02, "",
+        transform=ax.transAxes,
+        va="bottom",
+        family="monospace",
+    )
 
     dynamic_artists = []
 
@@ -1749,8 +1818,9 @@ def create_overview_animation():
             rocket_radius,
             ti,
             dynamic_artists,
-            arrow_scale=1.2,
+            arrow_scale=2.6,
             flame_scale=1.3,
+            min_arrow_fraction=0.32,
         )
 
         progress_line.set_data(R_anim[0, :frame_idx + 1], R_anim[1, :frame_idx + 1])
@@ -1762,7 +1832,21 @@ def create_overview_animation():
         moon_point.set_data([mp[0]], [mp[1]])
         moon_point.set_3d_properties([mp[2]])
 
-        thrust_kn = np.linalg.norm(thrust_vec)
+        thrust_kn = thrust_mag_anim[frame_idx]
+        engine_limit_kn = phase_tmax(ti)
+        thrust_percent = 100.0 * thrust_frac_anim[frame_idx]
+        thrust_cursor.set_xdata([ti / 3600.0, ti / 3600.0])
+        thrust_dot.set_data([ti / 3600.0], [thrust_percent])
+        thrust_hud.set_text(
+            "THRUST COMMAND\n"
+            f"phase  {phase_name(ti)}\n"
+            f"T      {thrust_kn:8.2f} / {engine_limit_kn:.1f} kN\n"
+            f"power  {thrust_percent:8.1f} %\n"
+            f"Tx     {thrust_vec[0]:8.2f} kN\n"
+            f"Ty     {thrust_vec[1]:8.2f} kN\n"
+            f"Tz     {thrust_vec[2]:8.2f} kN\n"
+            "red arrow = commanded direction"
+        )
         ax.set_title(
             "Earth -> Moon trajectory | "
             f"t={ti / 3600.0:.2f} h | {phase_name(ti)} | "
@@ -1770,7 +1854,16 @@ def create_overview_animation():
             "Arrow = thrust force, flame = exhaust; rocket scale exaggerated"
         )
 
-        return [progress_line, spacecraft_point, moon_point, landing_marker, *dynamic_artists]
+        return [
+            progress_line,
+            spacecraft_point,
+            moon_point,
+            landing_marker,
+            thrust_cursor,
+            thrust_dot,
+            thrust_hud,
+            *dynamic_artists,
+        ]
 
     anim = FuncAnimation(
         fig,
@@ -1784,7 +1877,7 @@ def create_overview_animation():
 
 
 # =============================================================================
-# 25. MOON-CENTERED DESCENT — INITIAL FRAME FIXED
+# 25. MOON-CENTERED DESCENT — LANDING-SITE TRACKING CAMERA
 # =============================================================================
 
 
@@ -1806,7 +1899,7 @@ def create_descent_context_animation():
     rocket_length = 70.0  # km, visualization only
     rocket_radius = 12.0  # km, visualization only
 
-    fig = plt.figure(figsize=(10, 8.5))
+    fig = plt.figure(figsize=(11.5, 8.5))
     ax = fig.add_subplot(111, projection="3d")
 
     moon_X, moon_Y, moon_Z = sphere_mesh(np.zeros(3), R_M, n_u=26, n_v=14)
@@ -1827,36 +1920,41 @@ def create_descent_context_animation():
         marker="*", markersize=12, linestyle="None", label="Landing site"
     )
 
-    # ------------------------------------------------------------------
-    # FIXED MOON VIEW FROM THE VERY FIRST DESCENT FRAME.
-    #
-    # The field of view is determined ONCE using the Moon radius and the
-    # spacecraft distance at frame 0.  We do not refit to the full path and
-    # update() never changes the axis limits or camera.  Therefore the first
-    # visible composition is literally frozen for the whole descent.
-    # ------------------------------------------------------------------
-    initial_radius = float(np.linalg.norm(R_rel[:, 0]))
-    moon_view_radius = 1.08 * max(initial_radius, R_M * 1.03)
+    # Look across the descent plane instead of from an arbitrary global angle.
+    # This makes altitude and down-range motion visually distinct while keeping
+    # the lunar limb behind the vehicle.  The direction stays fixed, avoiding
+    # a distracting camera orbit during the descent.
+    initial_offset = R_rel[:, 0] - landing_rel
+    approach_tangent = initial_offset - np.dot(initial_offset, n_land) * n_land
+    if np.linalg.norm(approach_tangent) < 1.0e-9:
+        v_rel_initial = V_abs[:, 0] - moon_vel[:, 0]
+        approach_tangent = v_rel_initial - np.dot(v_rel_initial, n_land) * n_land
+    view_direction = unit_vector(
+        np.cross(n_land, approach_tangent),
+        fallback=np.array([1.0, 0.0, 0.0]),
+    )
+    camera_elev = np.degrees(np.arcsin(np.clip(view_direction[2], -1.0, 1.0)))
+    camera_azim = np.degrees(np.arctan2(view_direction[1], view_direction[0]))
 
-    # Center the view on the Moon.  Since the vehicle only moves inward after
-    # descent begins, every later point remains inside this initial frame.
-    ax.set_xlim(-moon_view_radius, moon_view_radius)
-    ax.set_ylim(-moon_view_radius, moon_view_radius)
-    ax.set_zlim(-moon_view_radius, moon_view_radius)
+    initial_distance = float(np.linalg.norm(initial_offset))
+    initial_view_radius = max(0.68 * initial_distance, 120.0)
+    initial_center = landing_rel + 0.45 * initial_offset
+    ax.set_xlim(initial_center[0] - initial_view_radius, initial_center[0] + initial_view_radius)
+    ax.set_ylim(initial_center[1] - initial_view_radius, initial_center[1] + initial_view_radius)
+    ax.set_zlim(initial_center[2] - initial_view_radius, initial_center[2] + initial_view_radius)
     ax.set_box_aspect((1.0, 1.0, 1.0))
 
     ax.set_xlabel("Moon-relative X [km]")
     ax.set_ylabel("Moon-relative Y [km]")
     ax.set_zlabel("Moon-relative Z [km]")
 
-    # Camera is also fixed from frame 0 through touchdown.
-    ax.view_init(elev=25, azim=-48)
-    ax.set_proj_type("persp", focal_length=0.95)
+    ax.view_init(elev=camera_elev, azim=camera_azim)
+    ax.set_proj_type("persp", focal_length=1.15)
     ax.legend(loc="upper left")
 
-    fixed_view_note = ax.text2D(
+    tracking_view_note = ax.text2D(
         0.69, 0.02,
-        "MOON VIEW\nINITIAL FRAME FIXED\nNO ZOOM / NO CAMERA MOVE",
+        "DESCENT-PLANE SIDE VIEW\nLANDING-SITE TRACKING\nSMOOTH APPROACH ZOOM",
         transform=ax.transAxes,
         va="bottom",
         ha="left",
@@ -1882,6 +1980,19 @@ def create_descent_context_animation():
         thrust_vec = T_anim[:, frame_idx]
         axis = unit_vector(thrust_vec, fallback=v_rel)
 
+        # Follow the midpoint between the vehicle and landing site.  The view
+        # tightens continuously, but retains enough lunar surface to preserve
+        # scale and direction near touchdown.
+        remaining = p - landing_rel
+        remaining_distance = float(np.linalg.norm(remaining))
+        zoom_fraction = np.clip(remaining_distance / max(initial_distance, 1.0), 0.0, 1.0)
+        smooth_zoom = zoom_fraction * zoom_fraction * (3.0 - 2.0 * zoom_fraction)
+        view_radius = 85.0 + (initial_view_radius - 85.0) * smooth_zoom
+        center = landing_rel + (0.32 + 0.13 * smooth_zoom) * remaining
+        ax.set_xlim(center[0] - view_radius, center[0] + view_radius)
+        ax.set_ylim(center[1] - view_radius, center[1] + view_radius)
+        ax.set_zlim(center[2] - view_radius, center[2] + view_radius)
+
         body, nose, _ = rocket_mesh(p, axis, rocket_length, rocket_radius)
         Xb, Yb, Zb = body
         Xn, Yn, Zn = nose
@@ -1893,8 +2004,9 @@ def create_descent_context_animation():
             ax, p, thrust_vec, axis,
             rocket_length, rocket_radius, ti,
             dynamic_artists,
-            arrow_scale=1.1,
+            arrow_scale=1.8,
             flame_scale=1.5,
+            min_arrow_fraction=0.24,
         )
 
         progress_line.set_data(R_rel[0, :frame_idx + 1], R_rel[1, :frame_idx + 1])
@@ -1907,7 +2019,7 @@ def create_descent_context_animation():
         thrust_kn = np.linalg.norm(thrust_vec)
 
         ax.set_title(
-            "Moon-centered descent context\n"
+            "Lunar descent — landing-site tracking view\n"
             f"elapsed={(ti - t_start) / 60.0:.1f} min | "
             f"alt={altitude_km:.2f} km | speed={speed_ms:.2f} m/s | "
             f"thrust={thrust_kn:.1f} kN | mass={M_anim[frame_idx]:.0f} kg | "
@@ -2004,7 +2116,7 @@ def create_landing_local_animation():
     x_half = 1.20 * max_x
     y_half = 1.20 * max_y
     z_top = 1.08 * max_alt
-    z_bottom = -0.35
+    z_bottom = -0.05
 
     # Keep a little surface context even for a nearly vertical solution.
     x_half = max(x_half, 8.0)
@@ -2014,15 +2126,19 @@ def create_landing_local_animation():
     patch_half = min(90.0, max(15.0, 1.15 * max(x_half, y_half)))
     Xs, Ys, Zs = lunar_surface_patch(patch_half, n=65)
 
-    fig = plt.figure(figsize=(11.5, 8.0))
+    fig = plt.figure(figsize=(11.5, 8.5))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Lunar ground / horizon.
+    # The landing-site tangent plane is the visual floor at local Z=0.  This
+    # matches the altitude and landing-cone constraints used by the optimizer.
     ax.plot_surface(
         Xs, Ys, Zs,
-        alpha=0.60,
-        linewidth=0,
+        color="#777777",
+        alpha=0.78,
+        edgecolor="#9a9a9a",
+        linewidth=0.22,
         antialiased=True,
+        shade=True,
     )
 
     # Entire final landing path is shown faintly as context.
@@ -2051,15 +2167,28 @@ def create_landing_local_animation():
         label="Landing pad",
     )
 
-    # Landing cone guides remain fixed as spatial references.
+    # Landing cone constraint shown as a wireframe corridor.  Feasible vehicle
+    # positions lie inside this cone: horizontal error <= tan(angle) * altitude.
     guide_alt = np.linspace(0.0, min(z_top, GROUND_VIEW_START_ALT_KM), 60)
     guide_rad = np.tan(LANDING_CONE_ANGLE) * guide_alt
     guide_mask = guide_rad <= 0.95 * max(x_half, y_half)
     guide_alt = guide_alt[guide_mask]
     guide_rad = guide_rad[guide_mask]
     if len(guide_alt) > 1:
-        ax.plot(guide_rad, np.zeros_like(guide_alt), guide_alt, linestyle="--", linewidth=0.8, alpha=0.26)
-        ax.plot(-guide_rad, np.zeros_like(guide_alt), guide_alt, linestyle="--", linewidth=0.8, alpha=0.26)
+        cone_theta = np.linspace(0.0, 2.0 * np.pi, 25)
+        cone_R, cone_Theta = np.meshgrid(guide_rad, cone_theta)
+        cone_Z = np.broadcast_to(guide_alt, cone_R.shape)
+        ax.plot_wireframe(
+            cone_R * np.cos(cone_Theta),
+            cone_R * np.sin(cone_Theta),
+            cone_Z,
+            rstride=4,
+            cstride=10,
+            color="tab:orange",
+            linewidth=0.65,
+            alpha=0.32,
+            label=f"Landing cone ({np.degrees(LANDING_CONE_ANGLE):.0f} deg)",
+        )
 
     # ------------------------------------------------------------------
     # Ground observer camera.
@@ -2080,6 +2209,7 @@ def create_landing_local_animation():
     ax.set_ylim(-y_half, y_half)
     ax.set_zlim(z_bottom, z_top)
     ax.set_box_aspect((2.0 * x_half, 2.0 * y_half, 1.45 * z_top))
+    ax.zaxis.set_pane_color((0.0, 0.0, 0.0, 0.0))
 
     ax.set_xlabel("Local East [km]")
     ax.set_ylabel("Local North [km]")
@@ -2095,7 +2225,7 @@ def create_landing_local_animation():
 
     fixed_camera_note = ax.text2D(
         0.71, 0.02,
-        "GROUND CAMERA\nFIXED VIEW / NO ZOOM",
+        "ORANGE = POSITION CONSTRAINT\nGREEN/RED = CURRENT MARGIN",
         transform=ax.transAxes,
         va="bottom",
         ha="left",
@@ -2154,8 +2284,9 @@ def create_landing_local_animation():
             rocket_radius,
             ti,
             dynamic_artists,
-            arrow_scale=2.0,
+            arrow_scale=2.4,
             flame_scale=2.5,
+            min_arrow_fraction=0.22,
         )
 
         progress_line.set_data(
@@ -2172,6 +2303,50 @@ def create_landing_local_animation():
         vertical_ms = v[2] * 1000.0
         altitude_km = max(p[2], 0.0)
         horizontal_km = np.linalg.norm(p[:2])
+        cone_limit_km = np.tan(LANDING_CONE_ANGLE) * altitude_km
+        cone_margin_km = cone_limit_km - horizontal_km
+
+        descent_frac = np.clip(
+            (ti - TIME[K_DESCENT_START])
+            / max(T_TOTAL - TIME[K_DESCENT_START], 1.0),
+            0.0,
+            1.0,
+        )
+        speed_limit_ms = (
+            2.5 * (1.0 - descent_frac)**1.3 + 0.030
+        ) * 1000.0
+        if descent_frac >= 0.75:
+            terminal_frac = (descent_frac - 0.75) / 0.25
+            down_limit_ms = (
+                0.080 * (1.0 - terminal_frac) + TOUCHDOWN_SPEED_MAX
+            ) * 1000.0
+            horizontal_limit_ms = (
+                0.050 * (1.0 - terminal_frac) + TOUCHDOWN_HORIZONTAL_MAX
+            ) * 1000.0
+        else:
+            down_limit_ms = speed_limit_ms
+            horizontal_limit_ms = speed_limit_ms
+
+        cone_ok = cone_margin_km >= -1.0e-6
+        speed_ok = speed_ms <= speed_limit_ms + 1.0e-6
+        terminal_ok = (
+            -vertical_ms <= down_limit_ms + 1.0e-6
+            and horizontal_ms <= horizontal_limit_ms + 1.0e-6
+        )
+
+        # Ring at the current altitude makes the instantaneous position bound
+        # readable without having to infer it from the full cone wireframe.
+        if cone_limit_km <= 1.5 * max(x_half, y_half):
+            ring_theta = np.linspace(0.0, 2.0 * np.pi, 80)
+            constraint_ring, = ax.plot(
+                cone_limit_km * np.cos(ring_theta),
+                cone_limit_km * np.sin(ring_theta),
+                np.full_like(ring_theta, altitude_km),
+                color="tab:green" if cone_ok else "tab:red",
+                linewidth=1.8,
+                alpha=0.85,
+            )
+            dynamic_artists.append(constraint_ring)
 
         telemetry.set_text(
             f"elapsed       {(ti - t_start):8.1f} s\n"
@@ -2181,6 +2356,11 @@ def create_landing_local_animation():
             f"horizontal v  {horizontal_ms:8.2f} m/s\n"
             f"vertical v    {vertical_ms:8.2f} m/s\n"
             f"thrust        {thrust_kn:8.2f} kN\n"
+            f"cone margin   {cone_margin_km:8.3f} km  {'OK' if cone_ok else 'VIOL'}\n"
+            f"speed limit   {speed_limit_ms:8.2f} m/s  {'OK' if speed_ok else 'VIOL'}\n"
+            f"down limit    {down_limit_ms:8.2f} m/s\n"
+            f"horiz limit   {horizontal_limit_ms:8.2f} m/s  "
+            f"{'OK' if terminal_ok else 'VIOL'}\n"
             f"mass          {M_anim[frame_idx]:8.0f} kg\n"
             f"propellant    {prop_anim[frame_idx]:8.0f} kg"
         )
@@ -2215,11 +2395,88 @@ def create_landing_local_animation():
 # =============================================================================
 
 
+def write_combined_player_html(video_path, html_path):
+    """Write one lightweight browser player for the complete mission film."""
+    video_name = Path(video_path).name
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Apollo Mission — Complete Visualization</title>
+  <style>
+    html, body {{ margin: 0; height: 100%; background: #111; }}
+    body {{ display: grid; place-items: center; }}
+    video {{ width: min(100vw, 1380px); max-height: 100vh; background: #000; }}
+  </style>
+</head>
+<body>
+  <video controls preload="metadata">
+    <source src="{video_name}" type="video/mp4">
+  </video>
+</body>
+</html>
+"""
+    Path(html_path).write_text(html, encoding="utf-8")
+    print(f"Wrote combined mission player: {html_path}")
+
+
+def export_combined_mission_animation():
+    """Render the three camera stages and join them into one continuous film."""
+    if shutil.which("ffmpeg") is None:
+        print("ffmpeg not found -> combined mission export skipped")
+        return
+
+    scene_factories = [
+        ("01_overview.mp4", create_overview_animation),
+        ("02_descent.mp4", create_descent_context_animation),
+        ("03_landing.mp4", create_landing_local_animation),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="apollo_mission_") as temp_dir:
+        temp_path = Path(temp_dir)
+        clip_paths = []
+
+        for clip_name, factory in scene_factories:
+            fig, anim = factory()
+            clip_path = temp_path / clip_name
+            write_animation_mp4(anim, str(clip_path), ANIMATION_FPS)
+            plt.close(fig)
+            clip_paths.append(clip_path)
+
+        concat_list = temp_path / "clips.txt"
+        concat_list.write_text(
+            "".join(f"file '{path.as_posix()}'\n" for path in clip_paths),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_list),
+                "-c", "copy",
+                str(Path(COMBINED_MP4).resolve()),
+            ],
+            check=True,
+        )
+
+    print(f"Wrote complete mission animation: {COMBINED_MP4}")
+    write_combined_player_html(COMBINED_MP4, COMBINED_HTML)
+
+
 def export_matplotlib_animations():
     print("\n================ MATPLOTLIB ANIMATION EXPORT ================")
     print(f"Animation playback target: {ANIMATION_FPS} FPS")
     print("Thrust visualization: force arrow + exhaust flame enabled")
     print("Landing visualization: lunar ground-observer fixed camera (no zoom) enabled")
+
+    if GENERATE_COMBINED_MISSION:
+        print("Output mode: one continuous overview -> descent -> landing film")
+        export_combined_mission_animation()
+
+    if not (GENERATE_MPL_HTML or GENERATE_MPL_MP4 or SHOW_ANIMATION_WINDOW):
+        return
 
     overview_fig, overview_anim = create_overview_animation()
     if GENERATE_MPL_HTML:
